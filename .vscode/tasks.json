@@ -1,0 +1,40 @@
+// .vscode/tasks.json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Install Dependencies",
+      "type": "npm",
+      "script": "install",
+      "problemMatcher": [],
+      "presentation": { "clear": true },
+      "detail": "Runs 'npm install' to set up the project."
+    },
+    {
+      "label": "Start Dev Server",
+      "type": "npm",
+      "script": "dev",
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "vite",
+        "pattern": {
+          "regexp": "\\b(VITE)\\b\\s+\\S+\\s+ready in\\s+\\d+\\s+ms"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "VITE",
+          "endsPattern": "ready in"
+        }
+      },
+      "detail": "Runs 'npm run dev' and watches for the server to be ready."
+    },
+    {
+      "label": "Build for Production",
+      "type": "npm",
+      "script": "build",
+      "problemMatcher": ["$tsc"],
+      "group": { "kind": "build", "isDefault": true },
+      "detail": "Runs 'tsc -b && vite build' to create a production-ready build."
+    }
+  ]
+}

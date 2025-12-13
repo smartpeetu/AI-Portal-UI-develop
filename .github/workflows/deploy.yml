@@ -1,0 +1,320 @@
+name: Deploy to ECS
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: "us-west-2"
+
+  ECR_REPOSITORY: "exelixis-ai-platform-fe"
+  ECS_CLUSTER: "exelixis-ai-platform"
+  ECS_SERVICE: "exelixis-ai-platform-fe-svc"
+  ECS_CONTAINER_NAME: "frontend"
+
+  # Optional build inputs
+  BUILD_CONTEXT: "."
+  DOCKERFILE: "Dockerfile"
+
+  # Choose which tag to deploy: latest | sha
+  IMAGE_TAG_STRATEGY: "latest"
+
+concurrency:
+  group: deploy-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build_push_deploy:
+    name: Build, Push, and Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Derive names from repo
+        id: derive
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+
+          # Pull from env with fallbacks
+          ECR_REPO="${ECR_REPOSITORY:-$REPO_NAME}"
+          ECS_CLUSTER_VAL="${ECS_CLUSTER:-${REPO_NAME}-cluster}"
+          ECS_SERVICE_VAL="${ECS_SERVICE:-${REPO_NAME}-svc}"
+
+          echo "repo_name=$REPO_NAME" >> "$GITHUB_OUTPUT"
+          echo "ecr_repo=$ECR_REPO" >> "$GITHUB_OUTPUT"
+          echo "ecs_cluster=$ECS_CLUSTER_VAL" >> "$GITHUB_OUTPUT"
+          echo "ecs_service=$ECS_SERVICE_VAL" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/exelixis-github-actions-role
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure default Docker context
+        run: docker context use default
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        shell: bash
+        run: |
+          set -euo pipefail
+          REGISTRY="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          echo "Logging into ECR registry: $REGISTRY"
+          aws ecr get-login-password --region "${{ env.AWS_REGION }}" \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare image metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          ECR_REGISTRY="${{ steps.ecr-login.outputs.registry }}"
+          IMAGE="${ECR_REGISTRY}/${{ steps.derive.outputs.ecr_repo }}"
+          GIT_SHA="${GITHUB_SHA::7}"
+          DATE_TAG="$(date -u +'%Y%m%dT%H%M%SZ')"
+
+          echo "registry=$ECR_REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tag_sha=$GIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag_date=$DATE_TAG" >> "$GITHUB_OUTPUT"
+
+          # Decide which tag to deploy later
+          case "${IMAGE_TAG_STRATEGY}" in
+            latest) DEPLOY_TAG="latest" ;;
+            sha)    DEPLOY_TAG="$GIT_SHA" ;;
+            *)      echo "Unknown IMAGE_TAG_STRATEGY: ${IMAGE_TAG_STRATEGY}" >&2; exit 1 ;;
+          esac
+          echo "deploy_tag=$DEPLOY_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@988b5a0280414f521da01fcc63a27aeeb4b104db # v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@5cd11c3a4ced054e52742c5fd54dca954e0edd85 # v6
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE }}
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag_sha }}
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.tag_date }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # -------------------- ECS DEPLOY --------------------
+
+      - name: Ensure jq present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y && sudo apt-get install -y jq
+          fi
+          jq --version
+
+      - name: Resolve current task definition ARN
+        id: current-td
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLUSTER="${{ steps.derive.outputs.ecs_cluster }}"
+          SERVICE="${{ steps.derive.outputs.ecs_service }}"
+          echo "Resolving current task definition for $CLUSTER / $SERVICE ..."
+          TD_ARN=$(aws ecs describe-services \
+            --cluster "$CLUSTER" \
+            --services "$SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          if [[ -z "$TD_ARN" || "$TD_ARN" == "None" ]]; then
+            echo "ERROR: Could not resolve task definition ARN." >&2
+            exit 1
+          fi
+          echo "task_definition_arn=$TD_ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch current task definition
+        id: fetch-td
+        shell: bash
+        run: |
+          set -euo pipefail
+          TD_ARN="${{ steps.current-td.outputs.task_definition_arn }}"
+          aws ecs describe-task-definition \
+            --task-definition "$TD_ARN" \
+            --query 'taskDefinition' \
+            --output json > taskdef.json
+          test -s taskdef.json
+
+      - name: Decide if new task definition is needed
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          WANT_IMG="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.deploy_tag }}"
+          CONTAINER="${{ env.ECS_CONTAINER_NAME }}"
+          HAVE_IMG=$(jq -r --arg NAME "$CONTAINER" '
+            (.containerDefinitions[] | select(.name==$NAME) | .image) // ""' taskdef.json)
+
+          echo "Current TD image for '$CONTAINER': $HAVE_IMG"
+          echo "Desired image: $WANT_IMG"
+
+          if [[ "$HAVE_IMG" == "$WANT_IMG" ]]; then
+            echo "need_new_td=false" >> "$GITHUB_OUTPUT"
+            echo "info=Container already points to desired tag; will only force new deployment." >> "$GITHUB_OUTPUT"
+          else
+            echo "need_new_td=true" >> "$GITHUB_OUTPUT"
+            echo "info=Container points to a different tag; will register a new TD revision." >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: (Optional) Register new task definition revision
+        id: register-td
+        if: steps.decide.outputs.need_new_td == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Sanitizing read-only fields ..."
+          jq 'del(
+            .status,
+            .revision,
+            .taskDefinitionArn,
+            .requiresAttributes,
+            .compatibilities,
+            .registeredAt,
+            .registeredBy,
+            .deregisteredAt
+          )' taskdef.json > taskdef.clean.json
+
+          CONTAINER="${{ env.ECS_CONTAINER_NAME }}"
+          IMAGE_URI="${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.deploy_tag }}"
+          echo "Injecting image $IMAGE_URI into container $CONTAINER ..."
+          jq --arg NAME "$CONTAINER" --arg IMG "$IMAGE_URI" '
+            .containerDefinitions = (.containerDefinitions | map(
+              if .name == $NAME then .image = $IMG | . else . end
+            ))
+          ' taskdef.clean.json > taskdef.new.json
+
+          NEW_TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://taskdef.new.json \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "new_task_definition_arn=$NEW_TD_ARN" >> "$GITHUB_OUTPUT"
+          echo "Registered: $NEW_TD_ARN"
+
+      - name: Update ECS service (reuse existing TD if possible)
+        id: update-svc
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLUSTER="${{ steps.derive.outputs.ecs_cluster }}"
+          SERVICE="${{ steps.derive.outputs.ecs_service }}"
+          if [[ "${{ steps.decide.outputs.need_new_td }}" == "true" ]]; then
+            TD="${{ steps.register-td.outputs.new_task_definition_arn }}"
+          else
+            TD="${{ steps.current-td.outputs.task_definition_arn }}"
+          fi
+
+          echo "Updating service $SERVICE to task definition: $TD"
+          aws ecs update-service \
+            --cluster "$CLUSTER" \
+            --service "$SERVICE" \
+            --task-definition "$TD" \
+            --force-new-deployment \
+            --region "${{ env.AWS_REGION }}"
+          echo "Update submitted."
+
+      - name: Wait for service stability
+        id: wait-stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable \
+            --cluster "${{ steps.derive.outputs.ecs_cluster }}" \
+            --services "${{ steps.derive.outputs.ecs_service }}" \
+            --region "${{ env.AWS_REGION }}"
+          echo "Service is stable."
+
+      - name: Post-deploy verification (PRIMARY deployment summary)
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecs describe-services \
+            --cluster "${{ steps.derive.outputs.ecs_cluster }}" \
+            --services "${{ steps.derive.outputs.ecs_service }}" \
+            --query 'services[0].deployments[?status==`PRIMARY`].[taskDefinition,rolloutState,desiredCount,runningCount]' \
+            --output table
+
+      - name: Upload task definition artifacts
+        uses: actions/upload-artifact@6027e3dd177782cd8ab9af838c04fd81a07f1d47
+        with:
+          name: ecs-taskdef-files
+          path: |
+            taskdef.json
+            taskdef.clean.json
+            taskdef.new.json
+          if-no-files-found: ignore
+
+      # -------------------- Diagnostics (only if something fails above) --------------------
+
+      - name: ECS service events (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::ECS Service Events (recent 20)"
+          aws ecs describe-services \
+            --cluster "${{ steps.derive.outputs.ecs_cluster }}" \
+            --services "${{ steps.derive.outputs.ecs_service }}" \
+            --query 'services[0].events[0:20].[createdAt,message]' \
+            --output table || true
+          echo "::endgroup::"
+
+      - name: Last stopped tasks (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLUSTER="${{ steps.derive.outputs.ecs_cluster }}"
+          SERVICE="${{ steps.derive.outputs.ecs_service }}"
+          echo "::group::Last STOPPED tasks"
+          TASKS=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --desired-status STOPPED --max-items 10 --query 'taskArns' --output text || true)
+          if [[ -n "${TASKS:-}" ]]; then
+            aws ecs describe-tasks --cluster "$CLUSTER" --tasks $TASKS \
+              --query 'tasks[].{id:taskArn,stoppedReason:stoppedReason,exit:containers[].exitCode}' \
+              --output table || true
+          else
+            echo "No stopped tasks."
+          fi
+          echo "::endgroup::"
+
+      - name: Target group health (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Replace the TG ARN if you ever change it; keeping here for quick checks.
+          TG_ARN="arn:aws:elasticloadbalancing:us-west-2:${{ secrets.AWS_ACCOUNT_ID }}:targetgroup/ai-pltfm-dev-fe-tg/77b2d0d5a59ba961"
+          echo "::group::ALB Target Health"
+          aws elbv2 describe-target-health \
+            --target-group-arn "$TG_ARN" \
+            --query 'TargetHealthDescriptions[].{Target:Target.Id,State:TargetHealth.State,Reason:TargetHealth.Reason,Desc:TargetHealth.Description}' \
+            --output table || true
+          echo "::endgroup::"
+
+      - name: Output summary
+        run: |
+          echo "Deployed service: ${{ steps.derive.outputs.ecs_service }}" >> $GITHUB_STEP_SUMMARY
+          echo "Cluster: ${{ steps.derive.outputs.ecs_cluster }}" >> $GITHUB_STEP_SUMMARY
+          echo "Image: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.deploy_tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "Also tagged: :${{ steps.meta.outputs.tag_sha }}, :${{ steps.meta.outputs.tag_date }}" >> $GITHUB_STEP_SUMMARY
